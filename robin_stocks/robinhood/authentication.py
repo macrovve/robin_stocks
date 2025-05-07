@@ -1,61 +1,51 @@
 """Contains all functions for the purpose of logging in and out to Robinhood."""
 import getpass
 import os
+import sys
 import pickle
 import random
+import time
+import threading
 
 from robin_stocks.robinhood.helper import *
 from robin_stocks.robinhood.urls import *
 
 def generate_device_token():
     """This function will generate a token used when loggin on.
-
     :returns: A string representing the token.
-
     """
     rands = []
     for i in range(0, 16):
         r = random.random()
         rand = 4294967296.0 * r
         rands.append((int(rand) >> ((3 & i) << 3)) & 255)
-
     hexa = []
     for i in range(0, 256):
         hexa.append(str(hex(i+256)).lstrip("0x").rstrip("L")[1:])
-
     id = ""
     for i in range(0, 16):
         id += hexa[rands[i]]
-
         if (i == 3) or (i == 5) or (i == 7) or (i == 9):
             id += "-"
-
     return(id)
-
-
 def respond_to_challenge(challenge_id, sms_code):
     """This function will post to the challenge url.
-
     :param challenge_id: The challenge id.
     :type challenge_id: str
     :param sms_code: The sms code.
     :type sms_code: str
     :returns:  The response from requests.
-
     """
     url = challenge_url(challenge_id)
     payload = {
         'response': sms_code
     }
     return(request_post(url, payload))
-
-
 def login(username=None, password=None, expiresIn=86400, scope='internal', by_sms=True, store_session=True, mfa_code=None, pickle_path="", pickle_name=""):
     """This function will effectively log the user into robinhood by getting an
     authentication token and saving it to the session header. By default, it
     will store the authentication token in a pickle file and load that value
     on subsequent logins.
-
     :param username: The username for your robinhood account, usually your email.
         Not required if credentials are already cached and valid.
     :type username: Optional[str]
@@ -79,7 +69,6 @@ def login(username=None, password=None, expiresIn=86400, scope='internal', by_sm
         between different accounts without having to re-login every time.
     :returns:  A dictionary with log in information. The 'access_token' keyword contains the access token, and the 'detail' keyword \
     contains information on whether the access token was generated or loaded from pickle file.
-
     """
     device_token = generate_device_token()
     home_dir = os.path.expanduser("~")
@@ -98,7 +87,6 @@ def login(username=None, password=None, expiresIn=86400, scope='internal', by_sm
         challenge_type = "sms"
     else:
         challenge_type = "email"
-
     url = login_url()
     payload = {
         'client_id': 'c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBjFS',
@@ -114,10 +102,8 @@ def login(username=None, password=None, expiresIn=86400, scope='internal', by_sm
         'create_read_only_secondary_token':True,
         'request_id': '848bd19e-02bc-45d9-99b5-01bce5a79ea7'
     }
-
     if mfa_code:
         payload['mfa_code'] = mfa_code
-
     # If authentication has been stored in pickle file then load it. Stops login server from being pinged so much.
     if os.path.isfile(pickle_path):
         # If store_session has been set to false then delete the pickle file, otherwise try to load it.
@@ -151,16 +137,13 @@ def login(username=None, password=None, expiresIn=86400, scope='internal', by_sm
                 update_session('Authorization', None)
         else:
             os.remove(pickle_path)
-
     # Try to log in normally.
     if not username:
         username = input("Robinhood username: ")
         payload['username'] = username
-
     if not password:
         password = getpass.getpass("Robinhood password: ")
         payload['password'] = password
-
     data = request_post(url, payload)
     # Handle case where mfa or challenge is required.
     if data:
@@ -186,8 +169,9 @@ def login(username=None, password=None, expiresIn=86400, scope='internal', by_sm
                 'X-ROBINHOOD-CHALLENGE-RESPONSE-ID', challenge_id)
             data = request_post(url, payload)
         elif 'verification_workflow' in data:
+            print("Verification workflow required. Please check your Robinhood app for instructions.")
             workflow_id = data['verification_workflow']['id']
-            _validate_sherrif_id(device_token=device_token, workflow_id=workflow_id, mfa_code=mfa_code)
+            _validate_sherrif_id(device_token=device_token, workflow_id=workflow_id, mfa_code=mfa_code) 
             data = request_post(url, payload)
         # Update Session data with authorization or raise exception with the information present in data.
         if 'access_token' in data:
@@ -210,35 +194,64 @@ def login(username=None, password=None, expiresIn=86400, scope='internal', by_sm
         raise Exception('Error: Trouble connecting to robinhood API. Check internet connection.')
     return(data)
 
-def _validate_sherrif_id(device_token:str, workflow_id:str,mfa_code:str):
-    if mfa_code == None:
-        mfa_code = input("Please type in the MFA code: ")
+# Timer display function
+def display_timer(stop_timer):
+    total_time = 120  # Total time in seconds
+    start_time = time.time()
+    while not stop_timer.is_set():
+        elapsed = time.time() - start_time
+        remaining = total_time - elapsed
+        if remaining <= 0:
+            break
+        sys.stdout.write(f"\rWaiting for app approval. Time remaining: {remaining:.2f} seconds")
+        sys.stdout.flush()
+        time.sleep(1)
+    # Clear the line after stopping the timer
+    sys.stdout.write("\r" + " " * 100 + "\r")
+    sys.stdout.flush()
 
+def _validate_sherrif_id(device_token: str, workflow_id: str, mfa_code: str):
     url = "https://api.robinhood.com/pathfinder/user_machine/"
     payload = {
         'device_id': device_token,
         'flow': 'suv',
-        'input':{'workflow_id': workflow_id}
+        'input': {'workflow_id': workflow_id}
     }
-    data = request_post(url=url, payload=payload,json=True)
+    data = request_post(url=url, payload=payload, json=True)
     if "id" in data:
         inquiries_url = f"https://api.robinhood.com/pathfinder/inquiries/{data['id']}/user_view/"
         res = request_get(inquiries_url)
-        challenge_id=res['type_context']["context"]["sheriff_challenge"]["id"]
-        challenge_url = f"https://api.robinhood.com/challenge/{challenge_id}/respond/"
-        challenge_payload = {
-            'response': mfa_code
-        }
-        challenge_response = request_post(url=challenge_url, payload=challenge_payload,json=True )
-        if challenge_response["status"] == "validated":
-            inquiries_payload = {"sequence":0,"user_input":{"status":"continue"}}
-            inquiries_response = request_post(url=inquiries_url, payload=inquiries_payload,json=True )
-            if inquiries_response["type_context"]["result"] == "workflow_status_approved":
-                return
-            else:
-                raise Exception("workflow status  not approved")    
-        else:
-            raise Exception("Challenge not validated")
+        challenge_id = res["context"]["sheriff_challenge"]["id"]
+        challenge_url = f"https://api.robinhood.com/push/{challenge_id}/get_prompts_status/"
+        challenge_payload = {'response': mfa_code}
+        challenge_response = request_get(url=challenge_url)
+
+        # Start the timer in a separate thread
+        stop_timer = threading.Event()
+        timer_thread = threading.Thread(target=display_timer, args=(stop_timer,))
+        timer_thread.start()
+
+        try:
+            start_time = time.time()
+            while time.time() - start_time < 120:  # 2 minutes
+                time.sleep(5)
+                if challenge_response["challenge_status"] == "validated":
+                    inquiries_payload = {"sequence": 0, "user_input": {"status": "continue"}}
+                    inquiries_response = request_post(url=inquiries_url, payload=inquiries_payload, json=True)
+                    if inquiries_response["type_context"]["result"] == "workflow_status_approved":
+                        stop_timer.set()  # Stop the timer
+                        timer_thread.join()
+                        return
+                    else:
+                        raise Exception("Workflow status not approved")
+                else:
+                    challenge_response = request_get(url=challenge_url)
+
+            raise Exception("Login confirmation timed out. Please try again.")
+        finally:
+            stop_timer.set()  # Ensure the timer stops
+            timer_thread.join()
+
     raise Exception("Id not returned in user-machine call")
 
 def _get_sherrif_challenge(token_id:str):
@@ -246,14 +259,10 @@ def _get_sherrif_challenge(token_id:str):
     if "id" in data:
         return data["id"]
     raise Exception("Id not returned in user-machine call")
-
-
 @login_required
 def logout():
     """Removes authorization from the session header.
-
     :returns: None
-
     """
     set_login_state(False)
     update_session('Authorization', None)
